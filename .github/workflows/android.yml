@@ -1,0 +1,99 @@
+name: Build SubGenius
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project (unzip if needed)
+        run: |
+          F=$(find . -maxdepth 3 -name settings.gradle.kts -not -path './.git/*' | head -1)
+          if [ -z "$F" ]; then
+            Z=$(find . -maxdepth 2 -name 'SubGenius-Project-Complete.zip' -not -path './.git/*' | head -1)
+            [ -z "$Z" ] && Z=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -1)
+            if [ -n "$Z" ]; then
+              echo "Unzipping $Z"
+              unzip -oq "$Z" -d _project
+              F=$(find _project -maxdepth 3 -name settings.gradle.kts | head -1)
+            fi
+          fi
+          if [ -z "$F" ]; then
+            echo "::error::Project not found. Upload SubGenius-Project-Complete.zip to the repo root."
+            exit 1
+          fi
+          D=$(dirname "$F")
+          [ -f "$D/app/build.gradle.kts" ] || { echo "::error::app/build.gradle.kts missing in $D"; exit 1; }
+          echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
+          echo "Project found in: $D"
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Prepare signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > app/release.keystore
+            {
+              echo "KEYSTORE_PASSWORD=$KS_PASS"
+              echo "KEY_ALIAS=$KS_ALIAS"
+              echo "KEY_PASSWORD=${KS_KEYPASS:-$KS_PASS}"
+            } >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -keystore app/release.keystore -storepass subgenius-ci -keypass subgenius-ci \
+              -alias subgenius -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=SubGenius, O=SubGenius, C=US"
+            {
+              echo "KEYSTORE_PASSWORD=subgenius-ci"
+              echo "KEY_ALIAS=subgenius"
+              echo "KEY_PASSWORD=subgenius-ci"
+            } >> "$GITHUB_ENV"
+            echo "::warning::Temporary signing key used (not valid for Google Play)"
+          fi
+          echo "KEYSTORE_FILE=release.keystore" >> "$GITHUB_ENV"
+
+      - name: Build debug APK + release APK + AAB
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :app:assembleDebug :app:assembleRelease :app:bundleRelease --no-daemon --stacktrace
+
+      - name: Collect outputs
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/*.apk dist/SubGenius-debug.apk
+          cp app/build/outputs/apk/release/*.apk dist/SubGenius-release.apk
+          cp app/build/outputs/bundle/release/*.aab dist/SubGenius-release.aab
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SubGenius-builds
+          path: ${{ env.PROJECT_DIR }}/dist/*
+
+      - name: Publish GitHub Release (on v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PROJECT_DIR }}/dist/*
